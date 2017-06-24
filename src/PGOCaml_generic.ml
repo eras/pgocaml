@@ -307,6 +307,7 @@ val string_of_bool_array : bool_array -> string
 val string_of_int32_array : int32_array -> string
 val string_of_int64_array : int64_array -> string
 val string_of_string_array : string_array -> string
+val string_of_bytea_array : string_array -> string
 val string_of_float_array : float_array -> string
 
 val oid_of_string : string -> oid
@@ -794,7 +795,7 @@ let print_ErrorResponse fields =
   )
 
 (* Handle an ErrorResponse anywhere, by printing and raising an exception. *)
-let pg_error ?conn fields =
+let pg_error ?(sync = false) ?conn fields =
   print_ErrorResponse fields;
   let str =
     try
@@ -817,7 +818,12 @@ let pg_error ?conn fields =
 	 let msg = parse_backend_message msg in
 	 match msg with ReadyForQuery _ -> return () | _ -> loop ()
        in
-       loop ()
+       if sync then begin
+         let msg = new_message 'S' in
+         send_message conn msg >>= fun () ->
+         loop ()
+       end else
+         loop ()
   ) >>= fun () ->
 
   fail (PostgreSQL_Error (str, fields))
@@ -874,6 +880,10 @@ let profile_op uuid op detail f =
 
 (*----- Connection. -----*)
 
+let pgsql_socket dir port =
+  let sockaddr = sprintf "%s/.s.PGSQL.%d" dir port in
+  Unix.ADDR_UNIX sockaddr
+
 let connect ?host ?port ?user ?password ?database
     ?(unix_domain_socket_dir = PGOCaml_config.default_unix_domain_socket_dir)
     () =
@@ -919,11 +929,14 @@ let connect ?host ?port ?user ?password ?database
     | Some port -> port
     | None ->
 	try int_of_string (Sys.getenv "PGPORT")
-	with Not_found | Failure "int_of_string" -> 5432 in
+	with Not_found | Failure _ -> 5432 in
 
   (* Make the socket address. *)
   let sockaddr =
     match host with
+    | Some h when
+        String.length h > 0 && String.get h 0 = '/' ->
+      pgsql_socket h port
     | Some hostname ->
 	(try
 	   let hostent = Unix.gethostbyname hostname in
@@ -946,8 +959,7 @@ let connect ?host ?port ?user ?password ?database
 	     raise (Error ("PGOCaml: unknown host: " ^ hostname))
 	);
     | None -> (* Unix domain socket. *)
-	let sockaddr = sprintf "%s/.s.PGSQL.%d" unix_domain_socket_dir port in
-	Unix.ADDR_UNIX sockaddr in
+      pgsql_socket unix_domain_socket_dir port in
 
   (* Create a universally unique identifier for this connection.  This
    * is mainly for debugging and profiling.
@@ -960,7 +972,7 @@ let connect ?host ?port ?user ?password ?database
     let ppid =
       try
         Unix.getppid ()
-      with Invalid_argument "Unix.getppid not implemented" -> 0
+      with Invalid_argument _ -> 0
     in
     sprintf "%s %d %d %g %s %g"
       (Unix.gethostname ())
@@ -1025,7 +1037,7 @@ let connect ?host ?port ?user ?password ?database
       | AuthenticationSCMCredential ->
 	  fail (Error "PGOCaml: SCM Credential authentication not supported")
       | ErrorResponse err ->
-	  pg_error ~conn err
+	  pg_error err
       | NoticeResponse err ->
 	  (* XXX Do or print something here? *)
 	  loop None
@@ -1119,7 +1131,7 @@ let prepare conn ~query ?(name = "") ?(types = []) () =
       receive_message conn >>= fun msg ->
       let msg = parse_backend_message msg in
       match msg with
-      | ErrorResponse err -> pg_error err
+      | ErrorResponse err -> pg_error ~sync:true ~conn err
       | ParseComplete -> return () (* Finished! *)
       | NoticeResponse _ ->
 	  (* XXX Do or print something here? *)
@@ -1363,7 +1375,7 @@ let describe_statement conn ?(name = "") () =
   receive_message conn >>= fun msg ->
   let msg = parse_backend_message msg in
   ( match msg with
-    | ErrorResponse err -> pg_error err
+    | ErrorResponse err -> pg_error ~sync:true ~conn err
     | ParameterDescription params ->
 	let params = List.map (
 	  fun oid ->
@@ -1376,7 +1388,7 @@ let describe_statement conn ?(name = "") () =
   receive_message conn >>= fun msg ->
   let msg = parse_backend_message msg in
   match msg with
-  | ErrorResponse err -> pg_error err
+  | ErrorResponse err -> pg_error ~sync:true ~conn err
   | NoData -> return (params, None)
   | RowDescription fields ->
       let fields = List.map (
@@ -1404,7 +1416,7 @@ let describe_portal conn ?(portal = "") () =
   receive_message conn >>= fun msg ->
   let msg = parse_backend_message msg in
   match msg with
-  | ErrorResponse err -> pg_error err
+  | ErrorResponse err -> pg_error ~sync:true ~conn err
   | NoData -> return None
   | RowDescription fields ->
       let fields = List.map (
@@ -1438,13 +1450,18 @@ let name_of_type ?modifier = function
   | 21_l -> "int16"          (* INT2 *)
   | 23_l -> "int32"          (* INT4 *)
   | 25_l -> "string"         (* TEXT *)
+  | 114_l -> "string"        (* JSON *)
+  | 119_l -> "string_array"  (* JSON[] *)
   | 600_l -> "point"         (* POINT *)
   | 700_l
   | 701_l -> "float"	     (* FLOAT4, FLOAT8 *)
   | 869_l -> "inet"          (* INET *)
   | 1000_l -> "bool_array"   (* BOOLEAN[] *)
+  | 1001_l -> "bytea_array"   (* BYTEA[] *)
   | 1007_l -> "int32_array"  (* INT4[] *)
   | 1009_l -> "string_array" (* TEXT[] *)
+  | 1014_l -> "string_array"  (* CHAR[] *)
+  | 1015_l -> "string_array"  (* VARCHAR[] *)
   | 1016_l -> "int64_array"  (* INT8[] *)
   | 1021_l
   | 1022_l -> "float_array"  (* FLOAT4[], FLOAT8[] *)
@@ -1459,6 +1476,7 @@ let name_of_type ?modifier = function
   | 1700_l -> "string"       (* NUMERIC *)
   | 2950_l -> "uuid"         (* UUID *)
   | 3802_l -> "string"       (* JSONB *)
+  | 3807_l -> "string_array" (* JSONB[] *)
   | i ->
       (* For unknown types, look at <postgresql/catalog/pg_type.h>. *)
       raise (Error ("PGOCaml: unknown type for OID " ^ Int32.to_string i))
@@ -1577,19 +1595,10 @@ let string_of_string_array a = string_of_any_array (List.map (option_map escape_
 let string_of_float_array a = string_of_any_array (List.map (option_map string_of_float) a)
 
 let string_of_bytea b =
-  let len = String.length b in
-  let buf = Buffer.create (len * 2) in
-  for i = 0 to len - 1 do
-    let c = b.[i] in
-    let cc = Char.code c in
-    if cc < 0x20 || cc > 0x7e then
-      Buffer.add_string buf (sprintf "\\%03o" cc) (* non-print -> \ooo *)
-    else if c = '\\' then
-      Buffer.add_string buf "\\\\" (* \ -> \\ *)
-    else
-      Buffer.add_char buf c
-  done;
-  Buffer.contents buf
+  let `Hex b_hex = Hex.of_string b in  "\\x" ^ b_hex
+
+let string_of_bytea_array a =
+  string_of_any_array (List.map (option_map string_of_bytea) a)
 
 let string_of_string (x : string) = x
 let oid_of_string = Int32.of_string
@@ -1714,7 +1723,7 @@ let timestamptz_of_string str =
   let tz = match tz with
     | None -> Time_Zone.Local (* best guess? *)
     | Some tz ->
-	let sgn = match tz.[0] with '+' -> 1 | '-' -> 0 | _ -> assert false in
+	let sgn = match tz.[0] with '+' -> 1 | '-' -> -1 | _ -> assert false in
 	let mag = int_of_string (String.sub tz 1 2) in
 	Time_Zone.UTC_Plus (sgn * mag) in
   cal, tz
